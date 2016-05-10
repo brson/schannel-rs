@@ -117,7 +117,7 @@ enum SslCertConditionValue
 
 /// SSL wrapper for generic streams
 #[derive(Debug, Clone)]
-pub struct SslStream<S>
+pub struct SslStream<S> where S: Read + Write
 {
     stream: S,
     info: Arc<SslInfo>,
@@ -558,6 +558,9 @@ impl<S: Read + Write> SslStream<S>
                 debug!("Incomplete; Continue");
                 continue;
             }
+            if status == SEC_I_CONTEXT_EXPIRED {
+                panic!("context expired");
+            }
             if status == SEC_E_OK {
                 let status = unsafe { QueryContextAttributesW(ctxt, SECPKG_ATTR_STREAM_SIZES, &mut self.stream_sizes as *mut _ as *mut c_void) };
                 if status != SEC_E_OK {
@@ -604,9 +607,10 @@ impl<S: Read + Write> Read for SslStream<S>
             SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() },
             SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() },
             SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() },
+            SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() },
             SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() }
         ];
-        let mut message = SecBufferDesc { ulVersion: SECBUFFER_VERSION, cBuffers: 4, pBuffers: &mut buffers[0] as *mut SecBuffer};
+        let mut message = SecBufferDesc { ulVersion: SECBUFFER_VERSION, cBuffers: 5, pBuffers: &mut buffers[0] as *mut SecBuffer};
 
         // If we have some data in the buffer already, fetch as much as we might need
         if self.read_buf.len() > 0 {
@@ -625,6 +629,13 @@ impl<S: Read + Write> Read for SslStream<S>
             } else {
                 self.read_buf.clear();
             }
+
+            // Just return the data we've got. If this is the end of the stream
+            // then calling `read` is just going to result in a timeout.
+            for (d, s) in dst.iter_mut().zip(dst_vec.iter()) {
+                *d = *s;
+            }
+            return Ok(dst_vec.len());
         }
 
         //TODO: maybe handle that as separate reads/more efficiently?
@@ -646,17 +657,17 @@ impl<S: Read + Write> Read for SslStream<S>
                 buf.extend(&self.read_buf_raw[..]); //is a .clone() necessary here?
                 debug!("[EXTRA] read {}", self.read_buf_raw.len());
                 self.read_buf_raw.clear();
-            }
+            } else {
+                let mut i_read_buf = vec![0 as u8; 8192];
+                let bytes = self.stream.read(&mut i_read_buf).unwrap(); //Error Handling TODO
+                if bytes > 0 {
+                    buf.extend(&i_read_buf[..bytes]);
+                }
 
-            let mut i_read_buf = vec![0 as u8; 8192];
-            let bytes = self.stream.read(&mut i_read_buf).unwrap(); //Error Handling TODO
-            if bytes > 0 {
-                buf.extend(&i_read_buf[..bytes]);
-            }
-
-            if bytes + buf.len() == 0 {
-                //TODO: store unused buf data on break (read_buf_raw)
-                break;
+                if bytes + buf.len() == 0 {
+                    //TODO: store unused buf data on break (read_buf_raw)
+                    break;
+                }
             }
 
             buffers[0].pvBuffer = buf.as_mut_ptr() as *mut c_void;
@@ -666,6 +677,7 @@ impl<S: Read + Write> Read for SslStream<S>
             buffers[1].BufferType = SECBUFFER_EMPTY;
             buffers[2].BufferType = SECBUFFER_EMPTY;
             buffers[3].BufferType = SECBUFFER_EMPTY;
+            buffers[4].BufferType = SECBUFFER_EMPTY;
             unsafe {
                 status = DecryptMessage(ctxt as *mut SecHandle, &mut message as *mut SecBufferDesc, 0, ptr::null_mut());
                 debug!("decrypt status: {} -> {}", buf.len(), status);
@@ -673,6 +685,8 @@ impl<S: Read + Write> Read for SslStream<S>
                 // Store extra data (not decrypted yet = raw), if available
                 if status == SEC_E_INCOMPLETE_MESSAGE {
                     continue;
+                } else if status != SEC_E_OK {
+                    panic!("{}", status);
                 }
                 buf.clear();
 
@@ -738,9 +752,10 @@ impl<S: Read + Write> Write for SslStream<S>
             SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() },
             SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() },
             SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() },
+            SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() },
             SecBuffer { BufferType: SECBUFFER_EMPTY, cbBuffer: 0, pvBuffer: ptr::null_mut() }
         ];
-        let mut message = SecBufferDesc { ulVersion: SECBUFFER_VERSION, cBuffers: 4, pBuffers: &mut buffers[0] as *mut SecBuffer };
+        let mut message = SecBufferDesc { ulVersion: SECBUFFER_VERSION, cBuffers: 5, pBuffers: &mut buffers[0] as *mut SecBuffer };
 
         if self.stream_sizes.cbHeader == 0 {
             return Err(IoError::new(std::io::ErrorKind::Other, "SSLStream doesn't seem initialized. Maybe you forgot to call .init?"));
@@ -766,6 +781,7 @@ impl<S: Read + Write> Write for SslStream<S>
         buffers[2].BufferType   = SECBUFFER_STREAM_TRAILER;
 
         buffers[3].BufferType   = SECBUFFER_EMPTY;
+        buffers[4].BufferType   = SECBUFFER_EMPTY;
 
         let ctxt = get_mut_handle!(self, ctxt);
 
@@ -784,6 +800,25 @@ impl<S: Read + Write> Write for SslStream<S>
     #[inline]
     fn flush(&mut self) -> std::io::Result<()> {
         self.stream.flush()
+    }
+}
+
+impl<S: Read + Write> Drop for SslStream<S>
+{
+    fn drop(&mut self) {
+        let mut t = SCHANNEL_SHUTDOWN;
+        let mut buffers = [
+            SecBuffer { BufferType: SECBUFFER_TOKEN, cbBuffer: ::std::mem::size_of_val(&t) as u32, pvBuffer: &mut t as *mut u32 as *mut _ },
+        ];
+        let mut message = SecBufferDesc { ulVersion: SECBUFFER_VERSION, cBuffers: 1, pBuffers: &mut buffers[0] as *mut SecBuffer };
+
+        let ctxt = get_mut_handle!(self, ctxt);
+        let r = unsafe { ApplyControlToken(ctxt, &mut message as *mut SecBufferDesc) };
+        if r != SEC_E_OK {
+            panic!();
+        }
+
+        self.do_handshake().expect("openssl error during drop");
     }
 }
 
